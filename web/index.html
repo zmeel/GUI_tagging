@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BIGSdb AutoTag</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-inner">
+    <div>
+      <h1>BIGSdb AutoTag</h1>
+      <p class="sub">Tag alleles in the background with <code>autotag.pl</code></p>
+    </div>
+    <div class="slots" id="slots" aria-live="polite">…</div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="card" aria-labelledby="new-title">
+    <h2 id="new-title">New tagging session</h2>
+    <form id="start-form" novalidate>
+      <fieldset>
+        <legend>Database</legend>
+        <div class="choices" id="databases"></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Schemes</legend>
+        <div class="checks" id="schemes"></div>
+      </fieldset>
+
+      <div class="field">
+        <label for="isolates">Isolate ids</label>
+        <textarea id="isolates" rows="5" spellcheck="false"
+          placeholder="988, 989, 990, 991 … or one id per line. Ranges such as 988-1002 are allowed."></textarea>
+        <p class="hint" id="isolate-hint">Separate ids with commas, spaces or new lines.</p>
+      </div>
+
+      <div class="row">
+        <div class="field threads">
+          <label for="threads">Threads</label>
+          <input id="threads" type="number" min="1" value="1" inputmode="numeric">
+        </div>
+        <div class="actions">
+          <button type="submit" id="start-button" class="primary">Start tagging</button>
+        </div>
+      </div>
+      <p class="message" id="form-message" role="status"></p>
+    </form>
+  </section>
+
+  <section aria-labelledby="running-title">
+    <h2 id="running-title">Running</h2>
+    <div id="running"><p class="empty">Loading…</p></div>
+  </section>
+
+  <section aria-labelledby="history-title">
+    <h2 id="history-title">Finished</h2>
+    <div id="history"></div>
+  </section>
+</main>
+
+<footer class="wrap foot" id="foot"></footer>
+<script src="app.js"></script>
+</body>
+</html>
