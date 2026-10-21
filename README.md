@@ -22,7 +22,7 @@ browser ──> /autotag/api.cgi (www-data) ──sudo──> autotag-gui-helper
   the last free slot together. It then starts a detached runner in its own session, so the job is
   independent of the web request, sudo and Apache restarts.
 - The runner runs
-  `autotag.pl --database DB --schemes 1,2 --isolate_list_file <job>/isolates.txt [--threads N]`,
+  `autotag.pl --database DB --schemes 1,2 --isolate_list_file <job>/isolates.txt`,
   writes the output to `output.log` and counts the `Isolate: N; Locus: ...` lines for the progress bar.
   It also records the exit code when the run finishes.
 - A run whose process is gone, for example after a reboot, is shown as *Interrupted* and no longer
@@ -77,7 +77,7 @@ Edit `/etc/autotag-gui.conf` (Perl syntax). It holds:
 
 - the path to `autotag.pl` (now `/opt/BIGSdb-v_1.51.4/...`; **update it when you upgrade BIGSdb**);
 - the databases and schemes offered on the page;
-- `max_running` (3), `keep_finished` (50), `max_threads` and `max_isolates`;
+- `max_running` (3), `keep_finished` (50) and `max_isolates`;
 - `extra_args`: arguments always passed to `autotag.pl`, e.g. `[ '--fast' ]`.
 
 Changes take effect immediately; there is no need to restart Apache.

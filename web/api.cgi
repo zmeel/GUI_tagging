@@ -5,7 +5,7 @@
 #
 #   GET  api.cgi?action=status            settings and jobs (JSON)
 #   GET  api.cgi?action=log&job=JOB_ID    full autotag.pl output (text)
-#   POST api.cgi?action=start             JSON body {database, schemes, isolates, threads}
+#   POST api.cgi?action=start             JSON body {database, schemes, isolates}
 #   POST api.cgi?action=stop&job=JOB_ID
 
 use strict;
@@ -38,7 +38,7 @@ if ( $method eq 'GET' && $action eq 'status' ) {
 	if ( $action eq 'start' ) {
 		my $request = eval { decode_json( read_body() ) };
 		send_json( 400, { ok => 0, error => 'Invalid request.' } ) if ref $request ne 'HASH';
-		my %job = map { $_ => $request->{$_} } qw(database schemes isolates threads);
+		my %job = map { $_ => $request->{$_} } qw(database schemes isolates);
 		$job{'user'} = $ENV{'REMOTE_USER'} // q();
 		send_json( 200, run_helper( encode_json( \%job ), 'start' ) );
 	} elsif ( $action eq 'stop' ) {
@@ -60,7 +60,6 @@ sub status {
 		now          => time,
 		max_running  => $config->{'max_running'},
 		running      => scalar( grep { is_active( $_->{'state'} ) } @jobs ),
-		max_threads  => $config->{'max_threads'},
 		max_isolates => $config->{'max_isolates'},
 		databases    => [ map { { name => $_->{'name'}, label => $_->{'label'} // $_->{'name'} } } @{ $config->{'databases'} } ],
 		schemes      => [ map { { id => $_->{'id'}, label => $_->{'label'} // "Scheme $_->{'id'}", default => $_->{'default'} ? \1 : \0 } } @{ $config->{'schemes'} } ],
