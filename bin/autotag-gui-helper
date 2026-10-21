@@ -260,9 +260,11 @@ sub run_job {
 	my $progress = {
 		done             => 0,
 		current_isolate  => undef,
-		first_isolate_at => undef,
-		lines            => 0,
-		summary          => { tagged => 0, isolates_tagged => 0, missing => 0, errors => 0 }
+		first_isolate_at  => undef,
+		lines             => 0,
+		current_lines     => 0,    #Locus lines printed so far for the current isolate
+		max_isolate_lines => 0,    #Most locus lines printed for one completed isolate
+		summary           => { tagged => 0, isolates_tagged => 0, missing => 0, errors => 0 }
 	};
 	my $summary = $progress->{'summary'};
 	my %isolates_tagged;
@@ -292,6 +294,12 @@ sub run_job {
 				}
 				next if $line !~ /^Isolate:\s*(\d+);/x;
 				my $isolate = $1 + 0;
+
+				#One line per locus: the line count of a complete isolate shows how far the current one is.
+				if ( defined $progress->{'current_isolate'} && $isolate != $progress->{'current_isolate'} ) {
+					_isolate_completed($progress);
+				}
+				$progress->{'current_lines'}++;
 				$progress->{'current_isolate'} = $isolate;
 				$progress->{'first_isolate_at'} //= time;
 				my $done = $position{$isolate};
@@ -319,6 +327,7 @@ sub run_job {
 	waitpid( $pid, 0 );
 	my $exit_status = $?;
 	close $log;
+	_isolate_completed($progress) if $exit_status == 0 && !$stop_requested;
 	write_json( "$dir/progress.json", $progress );
 	my $state =
 	    $stop_requested || -e "$dir/stop.requested" ? 'stopped'
@@ -337,6 +346,14 @@ sub run_job {
 			message   => $message
 		}
 	);
+	return;
+}
+
+sub _isolate_completed {
+	my ($progress) = @_;
+	$progress->{'max_isolate_lines'} = $progress->{'current_lines'}
+	  if $progress->{'current_lines'} > $progress->{'max_isolate_lines'};
+	$progress->{'current_lines'} = 0;
 	return;
 }
 

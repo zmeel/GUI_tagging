@@ -58,6 +58,7 @@ sub status {
 		next if $job->{'state'} =~ /^(?:finished|queued|cancelled)$/x;
 		$job->{'tail'} = tail_lines( job_dir( $config, $job->{'id'} ) . '/output.log', TAIL_LINES );
 	}
+	set_expected_lines(@jobs);
 	my @queue = queued_jobs(@jobs);
 	$queue[$_]->{'queue_position'} = $_ + 1 foreach 0 .. $#queue;
 	return {
@@ -74,6 +75,28 @@ sub status {
 		jobs         => \@jobs,
 		user         => $ENV{'REMOTE_USER'}
 	};
+}
+
+#Locus lines a complete isolate produces, so the page can show progress within the current
+#isolate. Taken from earlier isolates of the same run, or from earlier runs with the same
+#database and schemes (old runs only have the average of their summary).
+sub set_expected_lines {
+	my @jobs = @_;
+	my %expected;
+	foreach my $job ( grep { !is_active( $_->{'state'} ) && $_->{'state'} ne 'queued' } @jobs ) {
+		my $lines = $job->{'max_lines'};
+		my $summary = $job->{'summary'} // {};
+		$lines ||= int( $summary->{'tagged'} / $summary->{'isolates_tagged'} ) if $summary->{'isolates_tagged'};
+		next if !$lines;
+		my $key = "$job->{'database'}|@{ $job->{'schemes'} }";
+		$expected{$key} = $lines if $lines > ( $expected{$key} // 0 );
+	}
+	foreach my $job ( grep { is_active( $_->{'state'} ) } @jobs ) {
+		my $key = "$job->{'database'}|@{ $job->{'schemes'} }";
+		my $lines = ( $job->{'max_lines'} // 0 ) > ( $expected{$key} // 0 ) ? $job->{'max_lines'} : $expected{$key};
+		$job->{'expected_lines'} = $lines if $lines;
+	}
+	return;
 }
 
 sub isolates {

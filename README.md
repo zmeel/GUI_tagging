@@ -39,8 +39,11 @@ browser ──> /autotag/api.cgi (www-data) ──sudo──> autotag-gui-helper
   starts the next queued session (oldest first). `/etc/cron.d/autotag-gui` runs
   `autotag-gui-helper dispatch` every minute as well, so the queue also moves on after a crash or reboot.
 - The summary counts the `Allele: N` lines (`Allele: 0` is a missing locus) and the
-  `Cannot insert ...` errors in the `autotag.pl` output. The time estimate uses the speed since the
-  first isolate.
+  `Cannot insert ...` errors in the `autotag.pl` output. The progress bar and time estimate also count how
+  far the current isolate is: `autotag.pl` prints one line per locus, so its lines so far are compared
+  with the number of lines a complete isolate gave earlier in the run, or in earlier runs with the same
+  database and schemes. The very first run of a database/scheme combination has no such reference
+  until its first isolate is complete.
 - Stop sends TERM to the job. `autotag.pl` then finishes the current locus and exits; the alleles tagged so
   far are kept. If the job has not stopped 30 seconds after Stop, *Force stop* kills it.
 
