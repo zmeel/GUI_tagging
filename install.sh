@@ -7,6 +7,7 @@
 #   /var/lib/autotag-gui/jobs/   job folders (owned by the BIGSdb user, readable by the web server)
 #   /var/www/html/autotag/       web page and API
 #   /etc/sudoers.d/autotag-gui   lets the web server run the helper as the BIGSdb user
+#   /etc/cron.d/autotag-gui      starts queued sessions after a crash or reboot
 #   /etc/apache2/conf-available/autotag-gui.conf
 #
 set -euo pipefail
@@ -45,6 +46,9 @@ echo "Installing web files in $WEB_DIR"
 install -d -o root -g root -m 755 "$WEB_DIR"
 install -o root -g root -m 644 web/index.html web/app.js web/style.css "$WEB_DIR/"
 install -o root -g root -m 755 web/api.cgi "$WEB_DIR/"
+
+echo "Installing cron job that starts queued sessions"
+install -o root -g root -m 644 etc/cron.d/autotag-gui /etc/cron.d/
 
 echo "Installing sudoers rule"
 visudo -cf etc/sudoers.d/autotag-gui

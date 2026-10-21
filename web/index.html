@@ -13,7 +13,10 @@
       <h1>BIGSdb AutoTag</h1>
       <p class="sub">Tag alleles in the background with <code>autotag.pl</code></p>
     </div>
-    <div class="slots" id="slots" aria-live="polite">…</div>
+    <div class="top-status">
+      <div class="slots" id="slots" aria-live="polite">…</div>
+      <div class="load" id="load"></div>
+    </div>
   </div>
 </header>
 
@@ -50,6 +53,11 @@
   <section aria-labelledby="running-title">
     <h2 id="running-title">Running</h2>
     <div id="running"><p class="empty">Loading…</p></div>
+  </section>
+
+  <section id="queue-section" aria-labelledby="queue-title" hidden>
+    <h2 id="queue-title">Queue</h2>
+    <div id="queue"></div>
   </section>
 
   <section aria-labelledby="history-title">

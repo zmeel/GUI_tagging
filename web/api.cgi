@@ -5,14 +5,15 @@
 #
 #   GET  api.cgi?action=status            settings and jobs (JSON)
 #   GET  api.cgi?action=log&job=JOB_ID    full autotag.pl output (text)
+#   GET  api.cgi?action=isolates&job=JOB_ID  isolate ids of a job (JSON), for "Run again"
 #   POST api.cgi?action=start             JSON body {database, schemes, isolates}
-#   POST api.cgi?action=stop&job=JOB_ID
+#   POST api.cgi?action=stop&job=JOB_ID    stop a running job or cancel a queued one
 
 use strict;
 use warnings;
 use lib '/opt/autotag-gui/lib';
 use AutotagGUI qw(
-  load_config encode_json decode_json is_job_id job_dir list_jobs job_info is_active tail_lines
+  load_config encode_json decode_json is_job_id job_dir list_jobs queued_jobs job_info is_active tail_lines
 );
 use IPC::Open3 qw(open3);
 
@@ -30,6 +31,8 @@ if ( $method eq 'GET' && $action eq 'status' ) {
 	send_json( 200, status() );
 } elsif ( $method eq 'GET' && $action eq 'log' ) {
 	send_log( $param{'job'} );
+} elsif ( $method eq 'GET' && $action eq 'isolates' ) {
+	send_json( 200, isolates( $param{'job'} ) );
 } elsif ( $method eq 'POST' ) {
 
 	#Browsers cannot add this header to cross-site requests, so other sites cannot start jobs.
@@ -52,20 +55,56 @@ sub status {
 	my @jobs = list_jobs($config);
 	foreach my $job (@jobs) {
 		delete $job->{'fingerprint'};
-		next if $job->{'state'} eq 'finished';
+		next if $job->{'state'} =~ /^(?:finished|queued|cancelled)$/x;
 		$job->{'tail'} = tail_lines( job_dir( $config, $job->{'id'} ) . '/output.log', TAIL_LINES );
 	}
+	my @queue = queued_jobs(@jobs);
+	$queue[$_]->{'queue_position'} = $_ + 1 foreach 0 .. $#queue;
 	return {
 		ok           => 1,
 		now          => time,
 		max_running  => $config->{'max_running'},
+		max_queued   => $config->{'max_queued'},
 		running      => scalar( grep { is_active( $_->{'state'} ) } @jobs ),
+		queued       => scalar @queue,
+		load         => server_load(),
 		max_isolates => $config->{'max_isolates'},
 		databases    => [ map { { name => $_->{'name'}, label => $_->{'label'} // $_->{'name'} } } @{ $config->{'databases'} } ],
 		schemes      => [ map { { id => $_->{'id'}, label => $_->{'label'} // "Scheme $_->{'id'}", default => $_->{'default'} ? \1 : \0 } } @{ $config->{'schemes'} } ],
 		jobs         => \@jobs,
 		user         => $ENV{'REMOTE_USER'}
 	};
+}
+
+sub isolates {
+	my ($id) = @_;
+	$id = is_job_id($id) // return { ok => 0, error => 'Invalid job id.' };
+	open( my $fh, '<', job_dir( $config, $id ) . '/isolates.txt' ) || return { ok => 0, error => 'Job not found.' };
+	my @ids = map { /^(\d+)$/x ? $1 + 0 : () } <$fh>;
+	close $fh;
+	return { ok => 1, isolates => \@ids };
+}
+
+#CPU load (1-minute average), number of cores and memory, from /proc.
+sub server_load {
+	my %load;
+	if ( open( my $fh, '<', '/proc/loadavg' ) ) {
+		( $load{'load'} ) = ( <$fh> // q() ) =~ /^([\d.]+)/x;
+		close $fh;
+	}
+	if ( open( my $fh, '<', '/proc/cpuinfo' ) ) {
+		$load{'cores'} = grep { /^processor\s*:/x } <$fh>;
+		close $fh;
+	}
+	if ( open( my $fh, '<', '/proc/meminfo' ) ) {
+		while ( my $line = <$fh> ) {
+			$load{'memory_total'}     = $1 * 1024 if $line =~ /^MemTotal:\s+(\d+)/x;
+			$load{'memory_available'} = $1 * 1024 if $line =~ /^MemAvailable:\s+(\d+)/x;
+		}
+		close $fh;
+	}
+	$load{'load'} += 0 if defined $load{'load'};
+	return \%load;
 }
 
 sub send_log {

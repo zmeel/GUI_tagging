@@ -1,0 +1,4 @@
+# AutoTag GUI - installed as /etc/cron.d/autotag-gui
+# Queued tagging sessions normally start as soon as a running one ends. This
+# also starts them when a session ended without doing so (crash, reboot).
+* * * * * bigsdb /opt/autotag-gui/bin/autotag-gui-helper dispatch >/dev/null 2>&1

@@ -10,10 +10,10 @@ use Exporter qw(import);
 use JSON::PP ();
 use POSIX qw(strftime);
 
-our $VERSION = '1.0';
+our $VERSION = '1.1';
 our @EXPORT_OK = qw(
   CONFIG_FILE load_config encode_json decode_json read_json write_json
-  is_job_id new_job_id job_dir boot_id list_jobs job_info is_active
+  is_job_id new_job_id job_dir boot_id list_jobs queued_jobs job_info is_active is_pending
   parse_isolate_ids tail_lines remove_job
 );
 
@@ -37,6 +37,7 @@ sub load_config {
 		die "Configuration $file: '$key' is not set.\n" if !defined $config->{$key};
 	}
 	$config->{'keep_finished'} //= 50;
+	$config->{'max_queued'}    //= 10;
 	$config->{'max_isolates'}  //= 50_000;
 	$config->{'extra_args'}    //= [];
 	return $config;
@@ -85,18 +86,33 @@ sub boot_id {
 	return $id =~ /^([0-9a-f-]+)/x ? $1 : q();
 }
 
+#Jobs that take one of the max_running slots.
 sub is_active {
 	my ($state) = @_;
 	return $state =~ /^(?:starting|running|stopping)$/x ? 1 : 0;
+}
+
+#Jobs that are running or waiting in the queue.
+sub is_pending {
+	my ($state) = @_;
+	return $state eq 'queued' || is_active($state) ? 1 : 0;
 }
 
 #All jobs, newest first.
 sub list_jobs {
 	my ($config) = @_;
 	opendir( my $dh, $config->{'jobs_dir'} ) || return;
-	my @ids = sort { $b cmp $a } grep { defined } map { is_job_id($_) } readdir $dh;
+	my @ids = grep { defined } map { is_job_id($_) } readdir $dh;
 	closedir $dh;
-	return grep { defined } map { job_info( $config, $_ ) } @ids;
+	return sort { $b->{'created'} <=> $a->{'created'} || $b->{'id'} cmp $a->{'id'} }
+	  grep { defined } map { job_info( $config, $_ ) } @ids;
+}
+
+#Queued jobs in the order they were added.
+sub queued_jobs {
+	my @jobs = @_;
+	return sort { $a->{'created'} <=> $b->{'created'} || $a->{'id'} cmp $b->{'id'} }
+	  grep { $_->{'state'} eq 'queued' } @jobs;
 }
 
 sub job_info {
@@ -110,30 +126,35 @@ sub job_info {
 	if ($result) {
 		$state = $result->{'state'};
 	} elsif ( !$status->{'runner_pid'} ) {
-		$state = time - $meta->{'created'} < START_GRACE ? 'starting' : 'interrupted';
+		$state =
+		    $meta->{'queued'}                      ? 'queued'
+		  : time - $meta->{'created'} < START_GRACE ? 'starting'
+		  :                                          'interrupted';
 	} elsif ( _runner_alive( $dir, $id, $status ) ) {
 		$state = -e "$dir/stop.requested" ? 'stopping' : 'running';
 	} else {
 		$state = 'interrupted';
 	}
 	my $info = {
-		id              => $id,
-		state           => $state,
-		database        => $meta->{'database'},
-		database_label  => $meta->{'database_label'},
-		schemes         => $meta->{'schemes'},
-		isolate_count   => $meta->{'isolate_count'},
-		user            => $meta->{'user'},
-		command         => $meta->{'command'},
-		fingerprint     => $meta->{'fingerprint'},
-		created         => $meta->{'created'},
-		started         => $status->{'started'},
-		finished        => $result ? $result->{'finished'} : undef,
-		exit_code       => $result ? $result->{'exit_code'} : undef,
-		message         => $result ? $result->{'message'} : undef,
-		done            => $progress->{'done'} // 0,
-		current_isolate => $progress->{'current_isolate'},
-		lines           => $progress->{'lines'} // 0,
+		id               => $id,
+		state            => $state,
+		database         => $meta->{'database'},
+		database_label   => $meta->{'database_label'},
+		schemes          => $meta->{'schemes'},
+		isolate_count    => $meta->{'isolate_count'},
+		user             => $meta->{'user'},
+		command          => $meta->{'command'},
+		fingerprint      => $meta->{'fingerprint'},
+		created          => $meta->{'created'},
+		started          => $status->{'started'},
+		finished         => $result ? $result->{'finished'} : undef,
+		exit_code        => $result ? $result->{'exit_code'} : undef,
+		message          => $result ? $result->{'message'} : undef,
+		done             => $progress->{'done'} // 0,
+		current_isolate  => $progress->{'current_isolate'},
+		first_isolate_at => $progress->{'first_isolate_at'},
+		summary          => $progress->{'summary'},
+		lines            => $progress->{'lines'} // 0,
 	};
 	$info->{'done'} = $info->{'isolate_count'} if $state eq 'finished';
 	return $info;
