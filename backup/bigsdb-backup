@@ -1,0 +1,126 @@
+#!/bin/bash
+#
+# Nightly backup of all BIGSdb PostgreSQL databases. Run as the postgres user from cron:
+#
+#   0 6 * * * /usr/local/bin/bigsdb-backup
+#
+# - Backs up every database on the server except 'postgres' and the templates, so new
+#   BIGSdb databases are included automatically. Roles and passwords are saved too
+#   (globals_DATE.sql), which you need to restore on a new server.
+# - pg_dump works on a consistent snapshot, so it is safe while people are tagging.
+# - Each dump is written to a temporary file and only kept if pg_dump succeeded and
+#   pg_restore can read it back.
+# - Old backups of a database are only removed after today's backup of it succeeded,
+#   so failing backups never delete the last good ones.
+# - Everything is logged in $BACKUP_DIR/bigsdb-backup.log. Errors are also printed, so
+#   cron emails them (set MAILTO in the crontab); a run without errors prints nothing.
+#
+# Settings can be overridden from the environment, e.g. in the crontab line:
+#   0 6 * * * KEEP_DAYS=14 EXCLUDE="bigsdb_jobs" /usr/local/bin/bigsdb-backup
+
+set -uo pipefail
+
+BACKUP_DIR="${BACKUP_DIR:-/data/sequtrecht_storage/postgresql/backups}"
+KEEP_DAYS="${KEEP_DAYS:-7}"                     #Remove backups older than this many days
+EXCLUDE="${EXCLUDE:-}"                          #Space-separated databases not to back up
+LOCK_WAIT_TIMEOUT="${LOCK_WAIT_TIMEOUT:-30min}" #Give up on a database if a table stays locked this long
+export PATH=/usr/local/bin:/usr/bin:/bin
+
+LOG="$BACKUP_DIR/bigsdb-backup.log"
+DATE=$(date +%Y%m%d)
+FAILED=()
+
+log() {
+	echo "$(date '+%F %T') $*" >>"$LOG"
+}
+
+fail() {
+	local name=$1 message=$2
+	FAILED+=("$name")
+	log "ERROR $name: $message"
+	echo "bigsdb-backup: $name: $message" >&2
+}
+
+#Removes backups of $1 older than KEEP_DAYS (old .tar backups included).
+remove_old() {
+	local name=$1
+	find "$BACKUP_DIR" -maxdepth 1 -type f -mtime +"$KEEP_DAYS" \
+		\( -name "${name}_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump" \
+		-o -name "${name}_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].tar" \
+		-o -name "${name}_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].sql" \) \
+		-printf "%TF %f removed\n" -delete >>"$LOG"
+}
+
+backup_globals() {
+	local file="$BACKUP_DIR/globals_$DATE.sql"
+	local partial="$BACKUP_DIR/.globals_$DATE.sql.partial"
+	local error
+	if ! error=$(pg_dumpall --globals-only --file="$partial" 2>&1); then
+		rm -f "$partial"
+		fail globals "pg_dumpall failed: $error"
+		return
+	fi
+	mv -f "$partial" "$file"
+	log "globals: OK"
+	remove_old globals
+}
+
+backup_database() {
+	local db=$1
+	local file="$BACKUP_DIR/${db}_$DATE.dump"
+	local partial="$BACKUP_DIR/.${db}_$DATE.dump.partial"
+	local start=$SECONDS
+	local error
+	if ! error=$(pg_dump --format=custom --lock-wait-timeout="$LOCK_WAIT_TIMEOUT" --file="$partial" "$db" 2>&1); then
+		rm -f "$partial"
+		fail "$db" "pg_dump failed: $error"
+		return
+	fi
+	if ! error=$(pg_restore --list "$partial" 2>&1 >/dev/null); then
+		rm -f "$partial"
+		fail "$db" "backup file cannot be read back: $error"
+		return
+	fi
+	mv -f "$partial" "$file"
+	log "$db: OK, $(du -h "$file" | cut -f1) in $((SECONDS - start))s"
+	remove_old "$db"
+}
+
+if [ ! -d "$BACKUP_DIR" ] || [ ! -w "$BACKUP_DIR" ]; then
+	echo "bigsdb-backup: $BACKUP_DIR is not a writable directory" >&2
+	exit 1
+fi
+umask 027
+
+#Only one backup at a time.
+exec 9>"$BACKUP_DIR/.bigsdb-backup.lock"
+if ! flock -n 9; then
+	echo "bigsdb-backup: another backup is still running" >&2
+	exit 1
+fi
+rm -f "$BACKUP_DIR"/.*.partial
+
+log "Backup started"
+if ! list=$(psql -XAtq -d postgres -c "SELECT datname FROM pg_database
+		WHERE datallowconn AND NOT datistemplate AND datname <> 'postgres' ORDER BY datname" 2>&1); then
+	fail databases "cannot list databases: $list"
+	exit 1
+fi
+mapfile -t DATABASES <<<"$list"
+
+backup_globals
+for db in "${DATABASES[@]}"; do
+	[ -z "$db" ] && continue
+	if [[ " $EXCLUDE " == *" $db "* ]]; then
+		log "$db: skipped (EXCLUDE)"
+		continue
+	fi
+	backup_database "$db"
+done
+
+log "Free space in $BACKUP_DIR: $(df -h --output=avail "$BACKUP_DIR" | tail -n 1 | tr -d ' ')"
+if ((${#FAILED[@]})); then
+	log "Backup finished with errors: ${FAILED[*]}"
+	exit 1
+fi
+log "Backup finished"

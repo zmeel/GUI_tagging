@@ -38,7 +38,6 @@ sub load_config {
 	}
 	$config->{'keep_finished'} //= 50;
 	$config->{'max_isolates'}  //= 50_000;
-	$config->{'max_threads'}   //= 8;
 	$config->{'extra_args'}    //= [];
 	return $config;
 }
@@ -124,7 +123,6 @@ sub job_info {
 		database_label  => $meta->{'database_label'},
 		schemes         => $meta->{'schemes'},
 		isolate_count   => $meta->{'isolate_count'},
-		threads         => $meta->{'threads'},
 		user            => $meta->{'user'},
 		command         => $meta->{'command'},
 		fingerprint     => $meta->{'fingerprint'},

@@ -4,7 +4,7 @@
 # Runs as the BIGSdb user through sudo; the web API never runs autotag.pl itself.
 #
 #   autotag-gui-helper start           job request as JSON on STDIN:
-#                                      {"database":..., "schemes":[...], "isolates":"...", "threads":1, "user":...}
+#                                      {"database":..., "schemes":[...], "isolates":"...", "user":...}
 #   autotag-gui-helper stop JOB_ID     stop a job (a second stop after 30 s kills it)
 #
 # Prints a JSON result: {"ok":1,...} or {"ok":0,"error":"..."}.
@@ -61,9 +61,6 @@ sub start_job {
 	my %wanted = map { ( $_ // q() ) => 1 } @{ ref $request->{'schemes'} eq 'ARRAY' ? $request->{'schemes'} : [] };
 	my @schemes = map { $_->{'id'} } grep { $wanted{ $_->{'id'} } } @{ $config->{'schemes'} };
 	die "Select at least one scheme.\n" if !@schemes;
-	my ($threads) = ( $request->{'threads'} // 1 ) =~ /^(\d{1,2})$/x;
-	die "Threads must be a number from 1 to $config->{'max_threads'}.\n"
-	  if !$threads || $threads > $config->{'max_threads'};
 	my ( $ids, $bad ) = parse_isolate_ids( $request->{'isolates'}, $config->{'max_isolates'} );
 	if (@$bad) {
 		my @show = @$bad > 5 ? ( @$bad[ 0 .. 4 ], '...' ) : @$bad;
@@ -103,7 +100,6 @@ sub start_job {
 		'--schemes'           => join( ',', @schemes ),
 		'--isolate_list_file' => "$dir/isolates.txt"
 	);
-	push @autotag, '--threads' => $threads if $threads > 1;
 	push @autotag, map { /^([\w.,=\-\/]+)$/x ? $1 : die "Invalid extra_args value '$_'.\n" } @{ $config->{'extra_args'} };
 	write_json(
 		"$dir/meta.json",
@@ -113,7 +109,6 @@ sub start_job {
 			database_label => $database->{'label'} // $database->{'name'},
 			schemes        => \@schemes,
 			isolate_count  => scalar @$ids,
-			threads        => $threads,
 			user           => $user // q(),
 			created        => time,
 			fingerprint    => $fingerprint,
@@ -121,8 +116,7 @@ sub start_job {
 		}
 	);
 	my $perl = $config->{'perl'} // '/usr/bin/perl';
-	spawn_runner( $id, $dir, [ $perl, '-I/opt/autotag-gui/lib', '-MAutotagGUI::Autoflush', @autotag ],
-		$ids, $threads, $lock );
+	spawn_runner( $id, $dir, [ $perl, '-I/opt/autotag-gui/lib', '-MAutotagGUI::Autoflush', @autotag ], $ids, $lock );
 	close $lock;
 
 	#Keep the newest finished jobs only.
@@ -133,7 +127,7 @@ sub start_job {
 
 #Double fork into a new session, so the job is independent of the web request, sudo and Apache.
 sub spawn_runner {
-	my ( $id, $dir, $command, $ids, $threads, $lock ) = @_;
+	my ( $id, $dir, $command, $ids, $lock ) = @_;
 	my $pid = fork // die "Cannot fork: $!\n";
 	if ($pid) {
 		waitpid( $pid, 0 );
@@ -157,7 +151,7 @@ sub spawn_runner {
 	open( STDOUT, '>>', "$dir/runner.log" );
 	open( STDERR, '>&', \*STDOUT );
 	$0 = "autotag-gui-runner $id";
-	eval { run_job( $dir, $command, $ids, $threads ) };
+	eval { run_job( $dir, $command, $ids ) };
 	if ($@) {
 		_log_error( $dir, $@ );
 		eval { write_json( "$dir/result.json", { state => 'failed', finished => time, message => "$@" } ) };
@@ -166,7 +160,7 @@ sub spawn_runner {
 }
 
 sub run_job {
-	my ( $dir, $command, $ids, $threads ) = @_;
+	my ( $dir, $command, $ids ) = @_;
 	my $stop_requested = 0;
 	local @SIG{qw(TERM INT HUP)} = ( sub { $stop_requested = 1 } ) x 3;
 	pipe( my $reader, my $writer ) || die "Cannot create pipe: $!\n";
@@ -184,11 +178,10 @@ sub run_job {
 	open( my $log, '>>', "$dir/output.log" ) || die "Cannot write $dir/output.log: $!\n";
 	$log->autoflush(1);
 
-	#Isolates are processed in ascending id order, so (without threads) everything
-	#before the current isolate is done - including isolates with nothing to tag.
+	#Isolates are processed in ascending id order, so everything before the
+	#current isolate is done - including isolates with nothing to tag.
 	my %position;
 	@position{@$ids} = ( 0 .. $#$ids );
-	my %seen;
 	my $progress = { done => 0, current_isolate => undef, lines => 0 };
 	my ( $buffer, $last_line, $last_progress, $last_heartbeat ) = ( q(), q(), 0, 0 );
 	my $select = IO::Select->new($reader);
@@ -210,9 +203,8 @@ sub run_job {
 				$progress->{'lines'}++;
 				$last_line = $line if $line =~ /\S/x;
 				next if $line !~ /^Isolate:\s*(\d+);/x;
-				$seen{$1} = 1;
 				$progress->{'current_isolate'} = $1 + 0;
-				my $done = $threads > 1 ? keys(%seen) - $threads : $position{$1};
+				my $done = $position{$1};
 				$progress->{'done'} = $done if defined $done && $done > $progress->{'done'};
 			}
 		}

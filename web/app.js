@@ -106,7 +106,6 @@ function buildForm() {
   schemes.replaceChildren(...settings.schemes.map((s) => el('label', {},
     el('input', { type: 'checkbox', name: 'scheme', value: s.id, checked: s.default }),
     s.label)));
-  $('threads').max = settings.max_threads;
   try {
     const remembered = localStorage.getItem('autotag-database');
     const input = [...document.querySelectorAll('input[name=database]')].find((i) => i.value === remembered);
@@ -159,7 +158,7 @@ async function startJob(event) {
   button.disabled = true;
   setMessage('Starting…');
   try {
-    await api('start', { method: 'POST', body: { database: database.value, schemes, isolates, threads: $('threads').value || 1 } });
+    await api('start', { method: 'POST', body: { database: database.value, schemes, isolates } });
     try { localStorage.setItem('autotag-database', database.value); } catch (e) { /* ignore */ }
     $('isolates').value = '';
     updateIsolateHint();
@@ -220,7 +219,6 @@ function renderRunning(jobs) {
           el('div', { class: 'job-title' }, `${job.database_label} `, el('span', { class: `badge ${job.state}` }, STATE_LABELS[job.state] || job.state)),
           el('div', { class: 'job-meta' },
             `${job.database} · ${schemeText(job)} · ${plural(total, 'isolate')}`,
-            job.threads > 1 ? ` · ${job.threads} threads` : '',
             ` · started ${when(started)}`, job.user ? ` by ${job.user}` : '')),
         el('div', { class: 'job-buttons' },
           el('a', { class: 'small', href: `${API}?action=log&job=${job.id}`, target: '_blank', rel: 'noopener' }, 'Full log'),

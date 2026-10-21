@@ -96,7 +96,6 @@ textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 
 .hint.bad { color: var(--bad); }
 
 .row { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
-.threads { width: 110px; margin-bottom: 0; }
 .actions { margin-left: auto; }
 
 button {
