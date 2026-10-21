@@ -153,6 +153,8 @@ sub job_info {
 		done             => $progress->{'done'} // 0,
 		current_isolate  => $progress->{'current_isolate'},
 		first_isolate_at => $progress->{'first_isolate_at'},
+		current_lines    => $progress->{'current_lines'},
+		max_lines        => $progress->{'max_isolate_lines'},
 		summary          => $progress->{'summary'},
 		lines            => $progress->{'lines'} // 0,
 	};

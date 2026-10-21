@@ -269,14 +269,25 @@ function summaryParts(job) {
   return parts.flatMap((part, i) => (i ? [' · ', part] : [part]));
 }
 
-// Seconds left, from the speed since the first isolate; null while there is too little to go on.
-function timeLeft(job) {
+// Isolates done, including how far the current isolate is: its locus lines so far compared
+// with the number of lines a complete isolate gave (in this run or earlier ones).
+function progressOf(job) {
   const total = job.isolate_count || 0;
   const done = Math.min(job.done || 0, total);
-  if (!job.first_isolate_at || done < 1 || done >= total) return null;
+  let current = 0;
+  if (job.expected_lines && job.current_lines && done < total) {
+    current = Math.min(job.current_lines / job.expected_lines, 0.99);
+  }
+  return { total, done, current, value: done + current };
+}
+
+// Seconds left, from the speed since the first isolate; null while there is too little to go on.
+function timeLeft(job) {
+  const { total, value } = progressOf(job);
+  if (!job.first_isolate_at || value < 0.02 || value >= total) return null;
   const elapsed = now() - job.first_isolate_at;
   if (elapsed < 30) return null;
-  return (elapsed / done) * (total - done);
+  return (elapsed / value) * (total - value);
 }
 
 function approximately(seconds) {
@@ -314,9 +325,8 @@ function renderRunning(jobs) {
     return;
   }
   container.replaceChildren(...jobs.map((job) => {
-    const total = job.isolate_count || 0;
-    const done = Math.min(job.done || 0, total);
-    const pct = total ? Math.round((done / total) * 100) : 0;
+    const { total, done, current, value } = progressOf(job);
+    const pct = total ? Math.round((value / total) * 100) : 0;
     const started = job.started || job.created;
     const waiting = !job.lines;
     const left = timeLeft(job);
@@ -326,12 +336,14 @@ function renderRunning(jobs) {
         el('a', { class: 'small', href: `${API}?action=log&job=${job.id}`, target: '_blank', rel: 'noopener' }, 'Full log'),
         job.state === 'starting' ? null
           : el('button', { class: 'small danger', type: 'button', onclick: () => stopJob(job) }, job.state === 'stopping' ? 'Force stop' : 'Stop')]),
-      el('div', { class: `bar${waiting ? ' indeterminate' : ''}`, role: 'progressbar', 'aria-valuemin': 0, 'aria-valuemax': total, 'aria-valuenow': done },
+      el('div', { class: `bar${waiting ? ' indeterminate' : ''}`, role: 'progressbar', 'aria-valuemin': 0, 'aria-valuemax': total, 'aria-valuenow': Math.round(value * 100) / 100 },
         el('div', { style: `width:${pct}%` })),
       el('div', { class: 'progress-text' },
         el('span', {}, waiting ? 'Preparing (loading isolates and loci)…'
-          : [el('strong', {}, `${done.toLocaleString()} / ${total.toLocaleString()}`), ` isolates done (${pct}%)`,
-            job.current_isolate ? ` · now at isolate ${job.current_isolate}` : '']),
+          : [el('strong', {}, `${done.toLocaleString()} / ${total.toLocaleString()}`), ' isolates done · ',
+            el('strong', {}, `${pct}%`), ' overall',
+            job.current_isolate ? ` · now at isolate ${job.current_isolate}` : '',
+            current && total > 1 ? ` (about ${Math.round(current * 100)}% of its loci)` : '']),
         el('span', {}, 'Running for ', el('strong', {}, duration(now() - started)),
           waiting ? '' : [' · ', left === null ? 'estimating time left…' : el('strong', {}, `${approximately(left)} left`)])),
       summary.length ? el('div', { class: 'progress-text summary' }, el('span', {}, summary, ' so far')) : null,
