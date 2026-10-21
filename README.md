@@ -95,3 +95,57 @@ configuration, the sudoers rule, and `RUN_AS`/`WEB_USER` at the top of `install.
   "Script already running with these parameters") appear there; errors from the runner appear at
   the end, under "Messages from the AutoTag GUI runner".
 - Jobs started from the command line are not shown on the page and do not count towards the limit.
+
+## Database backups
+
+`backup/bigsdb-backup` makes the nightly PostgreSQL backups. It replaces the separate `pg_dump` lines
+in the postgres crontab.
+
+- Backs up **every** database on the server except `postgres` and the templates, so new BIGSdb
+  databases are included automatically. That includes `bigsdb_auth`, `bigsdb_prefs`, `bigsdb_refs`,
+  `bigsdb_jobs` and `sequtrecht_bigsdb_users`. Roles and passwords are saved in `globals_DATE.sql`.
+- Uses `pg_dump -F custom` (compressed), one file per database: `DATABASE_YYYYMMDD.dump`.
+- Each dump is written to a temporary file. It is only kept if `pg_dump` succeeded and `pg_restore`
+  can read it back.
+- A database's backups older than 7 days are removed only after today's backup of that database
+  succeeded, so failing backups never delete the last good ones. Old `.tar` backups are cleaned up
+  the same way.
+- Everything is logged in `bigsdb-backup.log` in the backup folder. Errors are also printed, so cron
+  emails them. A successful run prints nothing.
+- `pg_dump` works on a consistent snapshot, so backups are safe while tagging sessions are running.
+  Tags added after a dump started are in the next day's backup.
+
+### Installation
+
+```sh
+sudo install -o root -g root -m 755 backup/bigsdb-backup /usr/local/bin/
+sudo -u postgres /usr/local/bin/bigsdb-backup     # test run; prints nothing when all is well
+sudo -u postgres crontab -e                       # replace the old lines with the contents of backup/crontab
+```
+
+Settings can be changed in the crontab line, for example
+`0 6 * * * KEEP_DAYS=14 EXCLUDE="bigsdb_jobs" /usr/local/bin/bigsdb-backup`:
+
+| Setting | Default | |
+| --- | --- | --- |
+| `BACKUP_DIR` | `/data/sequtrecht_storage/postgresql/backups` | where backups go |
+| `KEEP_DAYS` | `7` | remove backups older than this |
+| `EXCLUDE` | (none) | space-separated databases to skip |
+| `LOCK_WAIT_TIMEOUT` | `30min` | skip a database (and report it) if a table stays locked by a schema change |
+
+### Restoring
+
+```sh
+# Into a new, empty database (e.g. to look at old data):
+sudo -u postgres createdb ecoli_isolates_old
+sudo -u postgres pg_restore -d ecoli_isolates_old ecoli_isolates_20261021.dump
+
+# Replace a database completely (stop Apache first so nobody is using it):
+sudo -u postgres dropdb ecoli_isolates
+sudo -u postgres pg_restore --create -d postgres ecoli_isolates_20261021.dump
+
+# On a new server, restore roles and passwords first:
+sudo -u postgres psql -f globals_20261021.sql
+```
+
+Test a restore now and then. A backup you have never restored is not a proven backup.

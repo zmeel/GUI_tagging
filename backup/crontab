@@ -1,0 +1,4 @@
+# Crontab for the postgres user (crontab -e as postgres). Replaces the old pg_dump lines.
+# MAILTO receives a message only when a backup fails (requires a working mail setup on the server).
+MAILTO=you@example.org
+0 6 * * * /usr/local/bin/bigsdb-backup
