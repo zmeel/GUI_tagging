@@ -90,7 +90,7 @@ and reload Apache.
 
 Edit `/etc/autotag-gui.conf` (Perl syntax). It holds:
 
-- the path to `autotag.pl` (now `/opt/BIGSdb-v_1.51.4/...`; **update it when you upgrade BIGSdb**);
+- the path to `autotag.pl` (now `/opt/BIGSdb-v_1.54.1/...`; **update it when you upgrade BIGSdb**);
 - the databases and schemes offered on the page;
 - `max_running` (3), `max_queued` (10), `keep_finished` (50) and `max_isolates`;
 - `extra_args`: arguments always passed to `autotag.pl`, e.g. `[ '--fast' ]`.
