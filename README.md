@@ -4,8 +4,16 @@ A small web page for starting BIGSdb's `autotag.pl` in the background and follow
 
 - Pick a database, tick schemes, paste isolate ids (commas, spaces, new lines, or ranges such as `988-1002`).
 - The run continues on the server when you close the page; reopen it any time to see progress.
-- At most 3 sessions run at once (configurable). Identical runs cannot be started twice.
-- Running sessions can be stopped. Finished, failed, stopped and interrupted runs are listed with their full log.
+- At most 3 sessions run at once (configurable). Further sessions wait in a queue and start
+  automatically when a running one finishes; queued sessions can be cancelled.
+- Identical runs cannot be started or queued twice.
+- Each running session shows its progress, an estimate of the time left, and a summary of what was
+  tagged so far (alleles tagged, isolates, missing loci, errors).
+- Running sessions can be stopped. Finished, failed, stopped and interrupted runs are listed with
+  their summary and full log.
+- *Run again* copies a finished session's database, schemes and isolates into the form. For a stopped
+  or interrupted session, *Run remaining* copies only the isolates that were not done.
+- The page header shows the server's CPU load and free memory.
 
 ## How it works
 
@@ -27,6 +35,12 @@ browser ──> /autotag/api.cgi (www-data) ──sudo──> autotag-gui-helper
   It also records the exit code when the run finishes.
 - A run whose process is gone, for example after a reboot, is shown as *Interrupted* and no longer
   counts towards the limit.
+- When all slots are taken, a new session is registered as *queued*. When a run ends, its runner
+  starts the next queued session (oldest first). `/etc/cron.d/autotag-gui` runs
+  `autotag-gui-helper dispatch` every minute as well, so the queue also moves on after a crash or reboot.
+- The summary counts the `Allele: N` lines (`Allele: 0` is a missing locus) and the
+  `Cannot insert ...` errors in the `autotag.pl` output. The time estimate uses the speed since the
+  first isolate.
 - Stop sends TERM to the job. `autotag.pl` then finishes the current locus and exits; the alleles tagged so
   far are kept. If the job has not stopped 30 seconds after Stop, *Force stop* kills it.
 
@@ -53,6 +67,7 @@ Then open `https://sequtrecht.nl/autotag/`.
 | `/var/lib/autotag-gui/jobs/` | job folders, owner `bigsdb`, group `www-data` |
 | `/var/www/html/autotag/` | `index.html`, `app.js`, `style.css`, `api.cgi` |
 | `/etc/sudoers.d/autotag-gui` | `www-data` may run the helper as `bigsdb` |
+| `/etc/cron.d/autotag-gui` | starts queued sessions every minute if a run ended without doing so |
 | `/etc/apache2/conf-available/autotag-gui.conf` | enables CGI and the password for `/autotag` (`a2enmod cgi`, `a2enconf autotag-gui`) |
 
 At the end the installer checks that the web server can run the helper. The expected answer is
@@ -77,7 +92,7 @@ Edit `/etc/autotag-gui.conf` (Perl syntax). It holds:
 
 - the path to `autotag.pl` (now `/opt/BIGSdb-v_1.51.4/...`; **update it when you upgrade BIGSdb**);
 - the databases and schemes offered on the page;
-- `max_running` (3), `keep_finished` (50) and `max_isolates`;
+- `max_running` (3), `max_queued` (10), `keep_finished` (50) and `max_isolates`;
 - `extra_args`: arguments always passed to `autotag.pl`, e.g. `[ '--fast' ]`.
 
 Changes take effect immediately; there is no need to restart Apache.

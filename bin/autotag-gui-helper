@@ -1,11 +1,12 @@
 #!/usr/bin/perl -T
 #
-# AutoTag GUI helper - starts and stops autotag.pl jobs.
+# AutoTag GUI helper - starts, queues and stops autotag.pl jobs.
 # Runs as the BIGSdb user through sudo; the web API never runs autotag.pl itself.
 #
 #   autotag-gui-helper start           job request as JSON on STDIN:
 #                                      {"database":..., "schemes":[...], "isolates":"...", "user":...}
-#   autotag-gui-helper stop JOB_ID     stop a job (a second stop after 30 s kills it)
+#   autotag-gui-helper stop JOB_ID     stop a job (a second stop after 30 s kills it) or cancel a queued one
+#   autotag-gui-helper dispatch        start queued jobs if there are free slots (also run from cron)
 #
 # Prints a JSON result: {"ok":1,...} or {"ok":0,"error":"..."}.
 #
@@ -17,7 +18,7 @@ use warnings;
 use lib '/opt/autotag-gui/lib';
 use AutotagGUI qw(
   load_config encode_json decode_json read_json write_json is_job_id new_job_id
-  job_dir boot_id list_jobs job_info is_active parse_isolate_ids remove_job
+  job_dir boot_id list_jobs queued_jobs job_info is_active is_pending parse_isolate_ids remove_job
 );
 use Digest::MD5 qw(md5_hex);
 use Errno qw(EEXIST);
@@ -25,6 +26,7 @@ use Fcntl qw(:flock);
 use IO::Handle;
 use IO::Select;
 use POSIX ();
+use Time::HiRes ();
 
 use constant PROGRESS_INTERVAL  => 2;     #Seconds between progress file updates
 use constant HEARTBEAT_INTERVAL => 15;    #Seconds between heartbeats
@@ -36,13 +38,13 @@ $ENV{'TMPDIR'} = '/tmp';
 umask 027;
 
 my $config;
-my %commands = ( start => \&start_job, stop => \&stop_job );
+my %commands = ( start => \&start_job, stop => \&stop_job, dispatch => \&dispatch );
 my $command  = shift @ARGV // q();
 my $result   = eval {
 	$config = load_config();
 	my $user = getpwuid($<) // q();
 	die "This helper must run as user '$config->{'run_as'}', not '$user'.\n" if $user ne $config->{'run_as'};
-	die "Usage: autotag-gui-helper start|stop JOB_ID\n" if !$commands{$command};
+	die "Usage: autotag-gui-helper start|stop JOB_ID|dispatch\n" if !$commands{$command};
 	$commands{$command}->(@ARGV);
 };
 if ( !$result ) {
@@ -58,8 +60,7 @@ sub start_job {
 	die "Invalid request.\n" if ref $request ne 'HASH';
 	my ($database) = grep { $_->{'name'} eq ( $request->{'database'} // q() ) } @{ $config->{'databases'} };
 	die "Select a database.\n" if !$database;
-	my %wanted = map { ( $_ // q() ) => 1 } @{ ref $request->{'schemes'} eq 'ARRAY' ? $request->{'schemes'} : [] };
-	my @schemes = map { $_->{'id'} } grep { $wanted{ $_->{'id'} } } @{ $config->{'schemes'} };
+	my @schemes = valid_schemes( $request->{'schemes'} );
 	die "Select at least one scheme.\n" if !@schemes;
 	my ( $ids, $bad ) = parse_isolate_ids( $request->{'isolates'}, $config->{'max_isolates'} );
 	if (@$bad) {
@@ -71,17 +72,20 @@ sub start_job {
 	my $fingerprint = md5_hex( join '|', $database->{'name'}, "@schemes", "@$ids" );
 
 	#Hold the lock until the job is registered, so two requests cannot both take the last free slot.
-	open( my $lock, '>>', "$config->{'jobs_dir'}/.lock" )
-	  || die "Cannot open lock file in $config->{'jobs_dir'}: $!\n";
-	flock( $lock, LOCK_EX ) || die "Cannot lock $config->{'jobs_dir'}: $!\n";
-	my @jobs   = list_jobs($config);
-	my @active = grep { is_active( $_->{'state'} ) } @jobs;
-	die "The maximum of $config->{'max_running'} running tagging sessions has been reached.\n"
-	  if @active >= $config->{'max_running'};
-	foreach my $job (@active) {
-		die "An identical tagging session is already running (started $job->{'id'}).\n"
-		  if ( $job->{'fingerprint'} // q() ) eq $fingerprint;
+	my $lock    = get_lock();
+	my @jobs    = list_jobs($config);
+	my @pending = grep { is_pending( $_->{'state'} ) } @jobs;
+	foreach my $job (@pending) {
+		next if ( $job->{'fingerprint'} // q() ) ne $fingerprint;
+		die "An identical tagging session is already "
+		  . ( $job->{'state'} eq 'queued' ? 'queued' : 'running' )
+		  . " (started $job->{'id'}).\n";
 	}
+	my $running = grep { is_active( $_->{'state'} ) } @pending;
+	my $queued  = @pending - $running;
+	my $queue   = $running >= $config->{'max_running'};
+	die "The queue is full ($config->{'max_queued'} sessions waiting). Try again later.\n"
+	  if $queue && $queued >= $config->{'max_queued'};
 	my ( $id, $dir );
 	for ( 1 .. 20 ) {
 		$id  = new_job_id();
@@ -94,13 +98,6 @@ sub start_job {
 	open( my $fh, '>', "$dir/isolates.txt" ) || die "Cannot write $dir/isolates.txt: $!\n";
 	print $fh "$_\n" foreach @$ids;
 	close $fh;
-	my @autotag = (
-		$config->{'autotag_script'},
-		'--database'          => $database->{'name'},
-		'--schemes'           => join( ',', @schemes ),
-		'--isolate_list_file' => "$dir/isolates.txt"
-	);
-	push @autotag, map { /^([\w.,=\-\/]+)$/x ? $1 : die "Invalid extra_args value '$_'.\n" } @{ $config->{'extra_args'} };
 	write_json(
 		"$dir/meta.json",
 		{
@@ -110,19 +107,93 @@ sub start_job {
 			schemes        => \@schemes,
 			isolate_count  => scalar @$ids,
 			user           => $user // q(),
-			created        => time,
+			created        => sprintf( '%.3f', Time::HiRes::time() ) + 0,    #Keeps the queue in order
 			fingerprint    => $fingerprint,
-			command        => \@autotag
+			queued         => $queue ? 1 : 0,
+			command        => [ autotag_command( $database->{'name'}, \@schemes, $dir ) ]
 		}
 	);
-	my $perl = $config->{'perl'} // '/usr/bin/perl';
-	spawn_runner( $id, $dir, [ $perl, '-I/opt/autotag-gui/lib', '-MAutotagGUI::Autoflush', @autotag ], $ids, $lock );
+	launch_job( $id, $lock ) if !$queue;
 	close $lock;
 
 	#Keep the newest finished jobs only.
-	my @finished = grep { !is_active( $_->{'state'} ) } @jobs;
+	my @finished = grep { !is_pending( $_->{'state'} ) } @jobs;
 	remove_job( $config, $_->{'id'} ) foreach @finished[ $config->{'keep_finished'} .. $#finished ];
-	return { job_id => $id };
+	return { job_id => $id, queued => $queue ? $queued + 1 : 0 };
+}
+
+#Starts queued jobs, oldest first, while there are free slots.
+sub dispatch {
+	my $lock = get_lock();
+	my @jobs = list_jobs($config);
+	my $free = $config->{'max_running'} - grep { is_active( $_->{'state'} ) } @jobs;
+	my @started;
+	foreach my $job ( queued_jobs(@jobs) ) {
+		last if $free <= 0;
+		my $id = is_job_id( $job->{'id'} );
+		if ( eval { launch_job( $id, $lock ); 1 } ) {
+			push @started, $id;
+			$free--;
+		} else {
+			my $error = $@;
+			write_json( job_dir( $config, $id ) . '/result.json',
+				{ state => 'failed', finished => time, message => "Could not start: $error" } );
+		}
+	}
+	close $lock;
+	return { started => \@started };
+}
+
+sub get_lock {
+	open( my $lock, '>>', "$config->{'jobs_dir'}/.lock" )
+	  || die "Cannot open lock file in $config->{'jobs_dir'}: $!\n";
+	flock( $lock, LOCK_EX ) || die "Cannot lock $config->{'jobs_dir'}: $!\n";
+	return $lock;
+}
+
+#Scheme ids that are in the configuration (untainted).
+sub valid_schemes {
+	my ($requested) = @_;
+	my %wanted = map { ( $_ // q() ) => 1 } @{ ref $requested eq 'ARRAY' ? $requested : [] };
+	return map { $_->{'id'} } grep { $wanted{ $_->{'id'} } } @{ $config->{'schemes'} };
+}
+
+sub autotag_command {
+	my ( $database, $schemes, $dir ) = @_;
+	my @command = (
+		$config->{'autotag_script'},
+		'--database'          => $database,
+		'--schemes'           => join( ',', @$schemes ),
+		'--isolate_list_file' => "$dir/isolates.txt"
+	);
+	push @command,
+	  map { /^([\w.,=\-\/]+)$/x ? $1 : die "Invalid extra_args value '$_'.\n" } @{ $config->{'extra_args'} };
+	return @command;
+}
+
+#Starts the runner for a registered job. Settings are read back from the job folder
+#and checked against the configuration again, as they may have waited in the queue.
+sub launch_job {
+	my ( $id, $lock ) = @_;
+	my $dir  = job_dir( $config, $id );
+	my $meta = read_json("$dir/meta.json") // die "Cannot read $dir/meta.json\n";
+	my ($database) = grep { $_->{'name'} eq ( $meta->{'database'} // q() ) } @{ $config->{'databases'} };
+	die "Database $meta->{'database'} is no longer configured.\n" if !$database;
+	my @schemes = valid_schemes( $meta->{'schemes'} );
+	die "None of the schemes are configured any more.\n" if !@schemes;
+	open( my $fh, '<', "$dir/isolates.txt" ) || die "Cannot read $dir/isolates.txt: $!\n";
+	my @ids = map { /^(\d+)$/x ? $1 : () } <$fh>;
+	close $fh;
+	my $perl = $config->{'perl'} // '/usr/bin/perl';
+	spawn_runner(
+		$id, $dir,
+		[
+			$perl, '-I/opt/autotag-gui/lib', '-MAutotagGUI::Autoflush',
+			autotag_command( $database->{'name'}, \@schemes, $dir )
+		],
+		\@ids, $lock
+	);
+	return;
 }
 
 #Double fork into a new session, so the job is independent of the web request, sudo and Apache.
@@ -156,6 +227,10 @@ sub spawn_runner {
 		_log_error( $dir, $@ );
 		eval { write_json( "$dir/result.json", { state => 'failed', finished => time, message => "$@" } ) };
 	}
+
+	#This slot is free now - start the next queued job.
+	eval { dispatch() };
+	_log_error( $dir, "Could not start queued jobs: $@" ) if $@;
 	POSIX::_exit(0);
 }
 
@@ -182,7 +257,15 @@ sub run_job {
 	#current isolate is done - including isolates with nothing to tag.
 	my %position;
 	@position{@$ids} = ( 0 .. $#$ids );
-	my $progress = { done => 0, current_isolate => undef, lines => 0 };
+	my $progress = {
+		done             => 0,
+		current_isolate  => undef,
+		first_isolate_at => undef,
+		lines            => 0,
+		summary          => { tagged => 0, isolates_tagged => 0, missing => 0, errors => 0 }
+	};
+	my $summary = $progress->{'summary'};
+	my %isolates_tagged;
 	my ( $buffer, $last_line, $last_progress, $last_heartbeat ) = ( q(), q(), 0, 0 );
 	my $select = IO::Select->new($reader);
 	while (1) {
@@ -202,10 +285,28 @@ sub run_job {
 				my $line = $1;
 				$progress->{'lines'}++;
 				$last_line = $line if $line =~ /\S/x;
+				if ( $line =~ /^Cannot\s+insert\s+allele\s+(designation|sequence)/x ) {
+					$summary->{'errors'}++;
+					$summary->{'tagged'}-- if $1 eq 'designation' && $summary->{'tagged'};    #Printed before the insert
+					next;
+				}
 				next if $line !~ /^Isolate:\s*(\d+);/x;
-				$progress->{'current_isolate'} = $1 + 0;
-				my $done = $position{$1};
+				my $isolate = $1 + 0;
+				$progress->{'current_isolate'} = $isolate;
+				$progress->{'first_isolate_at'} //= time;
+				my $done = $position{$isolate};
 				$progress->{'done'} = $done if defined $done && $done > $progress->{'done'};
+
+				#"Allele: N" for each allele designated; "Allele: 0" marks a missing locus.
+				while ( $line =~ /Allele:\s*(\S+)/gx ) {
+					if ( $1 eq '0' ) {
+						$summary->{'missing'}++;
+					} else {
+						$summary->{'tagged'}++;
+						$isolates_tagged{$isolate} = 1;
+					}
+				}
+				$summary->{'isolates_tagged'} = keys %isolates_tagged;
 			}
 		}
 		if ( time - $last_progress >= PROGRESS_INTERVAL ) {
@@ -242,9 +343,14 @@ sub run_job {
 sub stop_job {
 	my ($id) = @_;
 	$id = is_job_id($id) // die "Invalid job id.\n";
-	my $job = job_info( $config, $id ) // die "Job not found.\n";
+	my $lock = get_lock();    #So a queued job cannot be started while it is cancelled
+	my $job  = job_info( $config, $id ) // die "Job not found.\n";
+	my $dir  = job_dir( $config, $id );
+	if ( $job->{'state'} eq 'queued' ) {
+		write_json( "$dir/result.json", { state => 'cancelled', finished => time } );
+		return { job_id => $id, cancelled => 1 };
+	}
 	die "This job is not running.\n" if !is_active( $job->{'state'} );
-	my $dir    = job_dir( $config, $id );
 	my $status = read_json("$dir/status.json") // die "This job has not started yet.\n";
 	my ($pgid) = ( $status->{'pgid'} // q() ) =~ /^(\d+)$/x;
 	die "Unknown process group for this job.\n" if !$pgid || $pgid <= 1;
@@ -254,6 +360,8 @@ sub stop_job {
 		write_json( "$dir/result.json",
 			{ state => 'stopped', finished => time, exit_code => undef, message => 'Stopped (killed).' } )
 		  if !-e "$dir/result.json";
+		close $lock;
+		dispatch();    #The killed runner cannot start the next queued job itself
 		return { job_id => $id, forced => 1 };
 	}
 	if ( !defined $requested ) {
