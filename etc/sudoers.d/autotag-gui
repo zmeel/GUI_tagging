@@ -1,0 +1,5 @@
+# AutoTag GUI - installed as /etc/sudoers.d/autotag-gui (mode 0440).
+# Lets the web server start and stop tagging jobs as the BIGSdb user, but only
+# through the helper, which validates every request.
+Defaults!/opt/autotag-gui/bin/autotag-gui-helper !requiretty
+www-data ALL=(bigsdb) NOPASSWD: /opt/autotag-gui/bin/autotag-gui-helper

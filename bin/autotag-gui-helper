@@ -1,0 +1,282 @@
+#!/usr/bin/perl -T
+#
+# AutoTag GUI helper - starts and stops autotag.pl jobs.
+# Runs as the BIGSdb user through sudo; the web API never runs autotag.pl itself.
+#
+#   autotag-gui-helper start           job request as JSON on STDIN:
+#                                      {"database":..., "schemes":[...], "isolates":"...", "threads":1, "user":...}
+#   autotag-gui-helper stop JOB_ID     stop a job (a second stop after 30 s kills it)
+#
+# Prints a JSON result: {"ok":1,...} or {"ok":0,"error":"..."}.
+#
+# Every value from the request is validated against /etc/autotag-gui.conf,
+# because anyone allowed to call this helper through sudo controls its input.
+
+use strict;
+use warnings;
+use lib '/opt/autotag-gui/lib';
+use AutotagGUI qw(
+  load_config encode_json decode_json read_json write_json is_job_id new_job_id
+  job_dir boot_id list_jobs job_info is_active parse_isolate_ids remove_job
+);
+use Digest::MD5 qw(md5_hex);
+use Errno qw(EEXIST);
+use Fcntl qw(:flock);
+use IO::Handle;
+use IO::Select;
+use POSIX ();
+
+use constant PROGRESS_INTERVAL  => 2;     #Seconds between progress file updates
+use constant HEARTBEAT_INTERVAL => 15;    #Seconds between heartbeats
+use constant FORCE_STOP_AFTER   => 30;    #A stop request older than this is turned into a kill
+
+$ENV{'PATH'} = '/usr/local/bin:/usr/bin:/bin';
+delete @ENV{qw(IFS CDPATH ENV BASH_ENV PERL5LIB PERL5OPT)};
+$ENV{'TMPDIR'} = '/tmp';
+umask 027;
+
+my $config;
+my %commands = ( start => \&start_job, stop => \&stop_job );
+my $command  = shift @ARGV // q();
+my $result   = eval {
+	$config = load_config();
+	my $user = getpwuid($<) // q();
+	die "This helper must run as user '$config->{'run_as'}', not '$user'.\n" if $user ne $config->{'run_as'};
+	die "Usage: autotag-gui-helper start|stop JOB_ID\n" if !$commands{$command};
+	$commands{$command}->(@ARGV);
+};
+if ( !$result ) {
+	( my $error = $@ || 'Unknown error.' ) =~ s/\s+$//x;
+	print encode_json( { ok => 0, error => $error } ), "\n";
+	exit 1;
+}
+print encode_json( { ok => 1, %$result } ), "\n";
+exit 0;
+
+sub start_job {
+	my $request = eval { local $/ = undef; decode_json( <STDIN> // q() ) };
+	die "Invalid request.\n" if ref $request ne 'HASH';
+	my ($database) = grep { $_->{'name'} eq ( $request->{'database'} // q() ) } @{ $config->{'databases'} };
+	die "Select a database.\n" if !$database;
+	my %wanted = map { ( $_ // q() ) => 1 } @{ ref $request->{'schemes'} eq 'ARRAY' ? $request->{'schemes'} : [] };
+	my @schemes = map { $_->{'id'} } grep { $wanted{ $_->{'id'} } } @{ $config->{'schemes'} };
+	die "Select at least one scheme.\n" if !@schemes;
+	my ($threads) = ( $request->{'threads'} // 1 ) =~ /^(\d{1,2})$/x;
+	die "Threads must be a number from 1 to $config->{'max_threads'}.\n"
+	  if !$threads || $threads > $config->{'max_threads'};
+	my ( $ids, $bad ) = parse_isolate_ids( $request->{'isolates'}, $config->{'max_isolates'} );
+	if (@$bad) {
+		my @show = @$bad > 5 ? ( @$bad[ 0 .. 4 ], '...' ) : @$bad;
+		die "Not valid isolate id(s): @show\n";
+	}
+	die "Enter at least one isolate id.\n" if !@$ids;
+	my ($user) = ( $request->{'user'} // q() ) =~ /^([\w.\@\-]{0,64})$/x;
+	my $fingerprint = md5_hex( join '|', $database->{'name'}, "@schemes", "@$ids" );
+
+	#Hold the lock until the job is registered, so two requests cannot both take the last free slot.
+	open( my $lock, '>>', "$config->{'jobs_dir'}/.lock" )
+	  || die "Cannot open lock file in $config->{'jobs_dir'}: $!\n";
+	flock( $lock, LOCK_EX ) || die "Cannot lock $config->{'jobs_dir'}: $!\n";
+	my @jobs   = list_jobs($config);
+	my @active = grep { is_active( $_->{'state'} ) } @jobs;
+	die "The maximum of $config->{'max_running'} running tagging sessions has been reached.\n"
+	  if @active >= $config->{'max_running'};
+	foreach my $job (@active) {
+		die "An identical tagging session is already running (started $job->{'id'}).\n"
+		  if ( $job->{'fingerprint'} // q() ) eq $fingerprint;
+	}
+	my ( $id, $dir );
+	for ( 1 .. 20 ) {
+		$id  = new_job_id();
+		$dir = job_dir( $config, $id );
+		last if mkdir( $dir, 0750 );
+		die "Cannot create $dir: $!\n" if $! != EEXIST;
+		undef $id;
+	}
+	die "Cannot create a job folder.\n" if !$id;
+	open( my $fh, '>', "$dir/isolates.txt" ) || die "Cannot write $dir/isolates.txt: $!\n";
+	print $fh "$_\n" foreach @$ids;
+	close $fh;
+	my @autotag = (
+		$config->{'autotag_script'},
+		'--database'          => $database->{'name'},
+		'--schemes'           => join( ',', @schemes ),
+		'--isolate_list_file' => "$dir/isolates.txt"
+	);
+	push @autotag, '--threads' => $threads if $threads > 1;
+	push @autotag, map { /^([\w.,=\-\/]+)$/x ? $1 : die "Invalid extra_args value '$_'.\n" } @{ $config->{'extra_args'} };
+	write_json(
+		"$dir/meta.json",
+		{
+			id             => $id,
+			database       => $database->{'name'},
+			database_label => $database->{'label'} // $database->{'name'},
+			schemes        => \@schemes,
+			isolate_count  => scalar @$ids,
+			threads        => $threads,
+			user           => $user // q(),
+			created        => time,
+			fingerprint    => $fingerprint,
+			command        => \@autotag
+		}
+	);
+	my $perl = $config->{'perl'} // '/usr/bin/perl';
+	spawn_runner( $id, $dir, [ $perl, '-I/opt/autotag-gui/lib', '-MAutotagGUI::Autoflush', @autotag ],
+		$ids, $threads, $lock );
+	close $lock;
+
+	#Keep the newest finished jobs only.
+	my @finished = grep { !is_active( $_->{'state'} ) } @jobs;
+	remove_job( $config, $_->{'id'} ) foreach @finished[ $config->{'keep_finished'} .. $#finished ];
+	return { job_id => $id };
+}
+
+#Double fork into a new session, so the job is independent of the web request, sudo and Apache.
+sub spawn_runner {
+	my ( $id, $dir, $command, $ids, $threads, $lock ) = @_;
+	my $pid = fork // die "Cannot fork: $!\n";
+	if ($pid) {
+		waitpid( $pid, 0 );
+		die "Could not start the job (see $dir/runner.log).\n" if $?;
+		return;
+	}
+	my $runner = POSIX::setsid() && fork;
+	if ( !defined $runner ) {
+		_log_error( $dir, "Cannot start runner: $!" );
+		POSIX::_exit(1);
+	}
+	if ($runner) {
+		eval {
+			write_json( "$dir/status.json",
+				{ runner_pid => $runner, pgid => getpgrp(), boot_id => boot_id(), started => time } );
+		};
+		POSIX::_exit( $@ ? 1 : 0 );
+	}
+	close $lock;
+	open( STDIN,  '<',  '/dev/null' );
+	open( STDOUT, '>>', "$dir/runner.log" );
+	open( STDERR, '>&', \*STDOUT );
+	$0 = "autotag-gui-runner $id";
+	eval { run_job( $dir, $command, $ids, $threads ) };
+	if ($@) {
+		_log_error( $dir, $@ );
+		eval { write_json( "$dir/result.json", { state => 'failed', finished => time, message => "$@" } ) };
+	}
+	POSIX::_exit(0);
+}
+
+sub run_job {
+	my ( $dir, $command, $ids, $threads ) = @_;
+	my $stop_requested = 0;
+	local @SIG{qw(TERM INT HUP)} = ( sub { $stop_requested = 1 } ) x 3;
+	pipe( my $reader, my $writer ) || die "Cannot create pipe: $!\n";
+	my $pid = fork // die "Cannot fork: $!\n";
+	if ( !$pid ) {
+		@SIG{qw(TERM INT HUP)} = ('DEFAULT') x 3;
+		close $reader;
+		open( STDOUT, '>&', $writer ) || POSIX::_exit(127);
+		open( STDERR, '>&', $writer ) || POSIX::_exit(127);
+		chdir $dir;
+		exec { $command->[0] } @$command or print STDERR "Cannot run $command->[0]: $!\n";
+		POSIX::_exit(127);
+	}
+	close $writer;
+	open( my $log, '>>', "$dir/output.log" ) || die "Cannot write $dir/output.log: $!\n";
+	$log->autoflush(1);
+
+	#Isolates are processed in ascending id order, so (without threads) everything
+	#before the current isolate is done - including isolates with nothing to tag.
+	my %position;
+	@position{@$ids} = ( 0 .. $#$ids );
+	my %seen;
+	my $progress = { done => 0, current_isolate => undef, lines => 0 };
+	my ( $buffer, $last_line, $last_progress, $last_heartbeat ) = ( q(), q(), 0, 0 );
+	my $select = IO::Select->new($reader);
+	while (1) {
+		if ( time - $last_heartbeat >= HEARTBEAT_INTERVAL ) {
+			if ( open( my $heartbeat, '>', "$dir/heartbeat" ) ) {
+				close $heartbeat;
+			}
+			$last_heartbeat = time;
+		}
+		if ( $select->can_read(5) ) {
+			my $bytes = sysread( $reader, my $chunk, 65_536 );
+			next if !defined $bytes && $!{'EINTR'};
+			last if !$bytes;
+			print $log $chunk;
+			$buffer .= $chunk;
+			while ( $buffer =~ s/^([^\n]*)\n//x ) {
+				my $line = $1;
+				$progress->{'lines'}++;
+				$last_line = $line if $line =~ /\S/x;
+				next if $line !~ /^Isolate:\s*(\d+);/x;
+				$seen{$1} = 1;
+				$progress->{'current_isolate'} = $1 + 0;
+				my $done = $threads > 1 ? keys(%seen) - $threads : $position{$1};
+				$progress->{'done'} = $done if defined $done && $done > $progress->{'done'};
+			}
+		}
+		if ( time - $last_progress >= PROGRESS_INTERVAL ) {
+			write_json( "$dir/progress.json", $progress );
+			$last_progress = time;
+		}
+	}
+	print $log $buffer if length $buffer;
+	$last_line = $buffer if $buffer =~ /\S/x;
+	waitpid( $pid, 0 );
+	my $exit_status = $?;
+	close $log;
+	write_json( "$dir/progress.json", $progress );
+	my $state =
+	    $stop_requested || -e "$dir/stop.requested" ? 'stopped'
+	  : $exit_status == 0                           ? 'finished'
+	  :                                               'failed';
+	my $message;
+	if ( $state eq 'failed' ) {
+		$message = $exit_status & 127 ? 'Killed by signal ' . ( $exit_status & 127 ) . q(.) : $last_line;
+	}
+	write_json(
+		"$dir/result.json",
+		{
+			state     => $state,
+			finished  => time,
+			exit_code => $exit_status & 127 ? undef : $exit_status >> 8,
+			message   => $message
+		}
+	);
+	return;
+}
+
+sub stop_job {
+	my ($id) = @_;
+	$id = is_job_id($id) // die "Invalid job id.\n";
+	my $job = job_info( $config, $id ) // die "Job not found.\n";
+	die "This job is not running.\n" if !is_active( $job->{'state'} );
+	my $dir    = job_dir( $config, $id );
+	my $status = read_json("$dir/status.json") // die "This job has not started yet.\n";
+	my ($pgid) = ( $status->{'pgid'} // q() ) =~ /^(\d+)$/x;
+	die "Unknown process group for this job.\n" if !$pgid || $pgid <= 1;
+	my $requested = ( stat "$dir/stop.requested" )[9];
+	if ( defined $requested && time - $requested >= FORCE_STOP_AFTER ) {
+		kill( 'KILL', -$pgid );
+		write_json( "$dir/result.json",
+			{ state => 'stopped', finished => time, exit_code => undef, message => 'Stopped (killed).' } )
+		  if !-e "$dir/result.json";
+		return { job_id => $id, forced => 1 };
+	}
+	if ( !defined $requested ) {
+		open( my $fh, '>', "$dir/stop.requested" ) || die "Cannot write $dir/stop.requested: $!\n";
+		close $fh;
+	}
+	kill( 'TERM', -$pgid ) || die "Could not signal the job: $!\n";
+	return { job_id => $id };
+}
+
+sub _log_error {
+	my ( $dir, $error ) = @_;
+	if ( open( my $fh, '>>', "$dir/runner.log" ) ) {
+		print $fh scalar(localtime) . " $error\n";
+		close $fh;
+	}
+	return;
+}
